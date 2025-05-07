@@ -286,7 +286,7 @@ impl Config {
     }
 }
 
-fn parse_addr<T: AsRef<str>>(s: Option<T>) -> anyhow::Result<SocketAddr> {
+pub fn parse_addr<T: AsRef<str>>(s: Option<T>) -> anyhow::Result<SocketAddr> {
     s.context("Missing address")?
         .as_ref()
         .to_socket_addrs()
@@ -295,13 +295,13 @@ fn parse_addr<T: AsRef<str>>(s: Option<T>) -> anyhow::Result<SocketAddr> {
         .context("Could not lookup address")
 }
 
-fn parse_ip(s: Option<&String>) -> anyhow::Result<IpAddr> {
+pub fn parse_ip(s: Option<&String>) -> anyhow::Result<IpAddr> {
     s.context("Missing IP address")?
         .parse::<IpAddr>()
         .context("Invalid IP address")
 }
 
-fn parse_private_key(s: &str) -> anyhow::Result<StaticSecret> {
+pub fn parse_private_key(s: &str) -> anyhow::Result<StaticSecret> {
     let decoded = base64::decode(s).context("Failed to decode private key")?;
     if let Ok::<[u8; 32], _>(bytes) = decoded.try_into() {
         Ok(StaticSecret::from(bytes))
@@ -310,7 +310,7 @@ fn parse_private_key(s: &str) -> anyhow::Result<StaticSecret> {
     }
 }
 
-fn parse_public_key(s: Option<&String>) -> anyhow::Result<PublicKey> {
+pub fn parse_public_key(s: Option<&String>) -> anyhow::Result<PublicKey> {
     let encoded = s.context("Missing public key")?;
     let decoded = base64::decode(encoded).context("Failed to decode public key")?;
     if let Ok::<[u8; 32], _>(bytes) = decoded.try_into() {
@@ -320,7 +320,7 @@ fn parse_public_key(s: Option<&String>) -> anyhow::Result<PublicKey> {
     }
 }
 
-fn parse_preshared_key(s: Option<&String>) -> anyhow::Result<Option<[u8; 32]>> {
+pub fn parse_preshared_key(s: Option<&String>) -> anyhow::Result<Option<[u8; 32]>> {
     if let Some(s) = s {
         let decoded = base64::decode(s).context("Failed to decode preshared key")?;
         if let Ok::<[u8; 32], _>(bytes) = decoded.try_into() {
@@ -333,7 +333,7 @@ fn parse_preshared_key(s: Option<&String>) -> anyhow::Result<Option<[u8; 32]>> {
     }
 }
 
-fn parse_keep_alive(s: Option<&String>) -> anyhow::Result<Option<u16>> {
+pub fn parse_keep_alive(s: Option<&String>) -> anyhow::Result<Option<u16>> {
     if let Some(s) = s {
         let parsed: u16 = s.parse().with_context(|| {
             format!(

@@ -27,7 +27,10 @@ pub mod wg;
 /// Starts the onetun tunnels in separate tokio tasks.
 ///
 /// Note: This future completes immediately.
-pub async fn start_tunnels(config: Config, bus: Bus) -> anyhow::Result<()> {
+pub async fn start_tunnels(
+    config: Config,
+    bus: Bus,
+) -> anyhow::Result<(Arc<WireGuardTunnel>, TcpPortPool, UdpPortPool)> {
     // Initialize the port pool for each protocol
     let tcp_port_pool = TcpPortPool::new();
     let udp_port_pool = UdpPortPool::new();
@@ -62,10 +65,6 @@ pub async fn start_tunnels(config: Config, bus: Bus) -> anyhow::Result<()> {
         tokio::spawn(async move { wg.produce_task().await });
     }
 
-    if config
-        .port_forwards
-        .iter()
-        .any(|pf| pf.protocol == PortProtocol::Tcp)
     {
         // TCP device
         let bus = bus.clone();
@@ -78,10 +77,6 @@ pub async fn start_tunnels(config: Config, bus: Bus) -> anyhow::Result<()> {
         tokio::spawn(async move { iface.poll_loop(device).await });
     }
 
-    if config
-        .port_forwards
-        .iter()
-        .any(|pf| pf.protocol == PortProtocol::Udp)
     {
         // UDP device
         let bus = bus.clone();
@@ -118,5 +113,5 @@ pub async fn start_tunnels(config: Config, bus: Bus) -> anyhow::Result<()> {
             });
     }
 
-    Ok(())
+    Ok((wg, tcp_port_pool, udp_port_pool))
 }

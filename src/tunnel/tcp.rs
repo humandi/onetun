@@ -3,12 +3,15 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
-use bytes::BytesMut;
+use anyhow::Context as AnyhowContext;
+use bytes::{BufMut, Bytes, BytesMut};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use tokio::io::AsyncWriteExt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
 use crate::config::{PortForwardConfig, PortProtocol};
 use crate::events::{Bus, Event};
@@ -70,6 +73,18 @@ pub async fn tcp_proxy_server(
             port_pool.release(virtual_port).await;
         });
     }
+}
+
+/// Creates a virtual TCP proxy server that returns a VirtualSocket for direct async I/O operations.
+/// This is different from tcp_proxy_server as it doesn't listen on a real TCP port,
+/// but instead provides a virtual socket interface for direct communication.
+pub async fn virtual_tcp_proxy_server(
+    port_forward: PortForwardConfig,
+    port_pool: TcpPortPool,
+    bus: Bus,
+) -> anyhow::Result<VirtualSocket> {
+    info!("Creating virtual TCP proxy for {}", port_forward.source);
+    VirtualSocket::new(port_forward, port_pool, bus).await
 }
 
 /// Handles a new TCP connection with its assigned virtual port.
@@ -208,4 +223,126 @@ impl TcpPortPool {
 struct TcpPortPoolInner {
     /// Remaining ports in the pool.
     queue: VecDeque<u16>,
+}
+
+/// A virtual socket that implements AsyncRead and AsyncWrite traits.
+/// This allows direct interaction with the virtual port as if it were a regular socket.
+pub struct VirtualSocket {
+    virtual_port: VirtualPort,
+    read_buffer: BytesMut,
+    write_buffer: BytesMut,
+    rx: mpsc::Receiver<Bytes>,
+    tx: mpsc::Sender<Bytes>,
+    bus: Bus,
+    port_forward: PortForwardConfig,
+}
+
+impl VirtualSocket {
+    /// Creates a new virtual socket connection.
+    pub async fn new(
+        port_forward: PortForwardConfig,
+        port_pool: TcpPortPool,
+        bus: Bus,
+    ) -> anyhow::Result<Self> {
+        let virtual_port = port_pool
+            .next()
+            .await
+            .context("Failed to get next virtual port")?;
+        let (tx, rx) = mpsc::channel(100); // Buffer size of 100 messages
+
+        let socket = Self {
+            virtual_port,
+            read_buffer: BytesMut::with_capacity(MAX_PACKET),
+            write_buffer: BytesMut::with_capacity(MAX_PACKET),
+            rx,
+            tx,
+            bus: bus.clone(),
+            port_forward,
+        };
+
+        // Spawn a task to handle the event bus communication
+        let tx = socket.tx.clone();
+        let mut endpoint = bus.new_endpoint();
+        endpoint.send(Event::ClientConnectionInitiated(port_forward, virtual_port));
+
+        tokio::spawn(async move {
+            loop {
+                match endpoint.recv().await {
+                    Event::RemoteData(vp, data) if vp == virtual_port => {
+                        if tx.send(data).await.is_err() {
+                            break; // Channel closed, socket was dropped
+                        }
+                    }
+                    Event::ClientConnectionDropped(vp) if vp == virtual_port => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            endpoint.send(Event::ClientConnectionDropped(virtual_port));
+        });
+
+        Ok(socket)
+    }
+
+    /// Get the virtual port number assigned to this socket
+    pub fn virtual_port(&self) -> VirtualPort {
+        self.virtual_port
+    }
+}
+
+impl AsyncRead for VirtualSocket {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // First try to read from our buffer
+        if !self.read_buffer.is_empty() {
+            let to_copy = std::cmp::min(buf.remaining(), self.read_buffer.len());
+            buf.put_slice(&self.read_buffer[..to_copy]);
+            self.read_buffer.split_to(to_copy); // Use split_to instead of advance
+            return Poll::Ready(Ok(()));
+        }
+
+        // Then try to get more data from the channel
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                self.read_buffer.extend_from_slice(&data);
+                let to_copy = std::cmp::min(buf.remaining(), self.read_buffer.len());
+                buf.put_slice(&self.read_buffer[..to_copy]);
+                self.read_buffer.split_to(to_copy); // Use split_to instead of advance
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF - channel closed
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for VirtualSocket {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut endpoint = self.bus.new_endpoint();
+        endpoint.send(Event::LocalData(
+            self.port_forward,
+            self.virtual_port,
+            buf.to_vec().into(),
+        ));
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // No buffering in our implementation, so flush is a no-op
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut endpoint = self.bus.new_endpoint();
+        endpoint.send(Event::ClientConnectionDropped(self.virtual_port));
+        Poll::Ready(Ok(()))
+    }
 }
